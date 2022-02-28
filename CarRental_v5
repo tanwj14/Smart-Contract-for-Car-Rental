@@ -1,0 +1,519 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.7.0 <0.9.0;
+
+/***************************************************************************************************************/
+/***************************************************************************************************************/
+/*  Contract to facilitate car rental              
+/*  Car type available:                            
+/*    a. 4-seater = 1 ETH/day                      
+/*    b. 6-seater = 2 ETH/day                      
+/*    c. 8-seater = 3 ETH/day 
+/*
+/*  Process flow:
+/*    1. Company's wallet account deploys the contract 
+/*    2. Listing of car fleet for rent 
+/*       - only company's account can add
+/*       - 10ETH to be added into the contract for each car to instill confidence of availability
+/*    3. Customer check availability 
+/*       - check that value in contract now matches number of cars available with ratio 1car:10ETH 
+/*    4. Customer choose a available car to rent and deposit 10ETH per number of days intended to rent to show commitment. 
+/*       - Will fail if user has a prior rental record that indicates existing outstanding fees. Proceed to pay fine if so.  
+/*    5. Once deposit received from customer, company release car key to customer and key in start date. Contract amount will be reduced.  
+/*    6. Car returned, company key in end date to calculate cost of rent base on days. Cost of any damage will be added to the total cost
+/*       - Deduct from deposit; if extra will be returned to customer, shortfall will be recorded as outstanding fees which until it is paid, 
+/*         will not allow user to rent
+/*    7. Once done, avail the car by changing state to available 
+/****************************************************************************************************************/
+/****************************************************************************************************************/
+
+contract CarRental {
+
+  /********************************************************************************************************/
+  /*                                           Declarations                                               */
+  /********************************************************************************************************/
+
+    // Designing a structure to store the information of ABC Rental company's car fleet 
+    struct carInfo {
+      string carPlate; 
+      string carInfo; // Short description about car
+      uint carType; // How many seater: 4/6/8
+      bool carAvailable; // True: Available, False: N.Available 
+    }
+
+    // Designing a structure to store the information of Customers.  
+    struct customerInfo {
+      string name; 
+      string identityNum;  
+      uint age;
+      string resiAdd; // Residential address
+      address walletAdd; // Wallet address of customer
+    }
+
+    // Designing a structure to store the car renting history 
+    struct rentalHistory {
+      string carPlate; 
+      string name;   
+      address walletAdd;
+      uint depositAmt;
+      uint startDate;  
+      uint endDate;
+      uint numOfDays; // Number of days user intend to rent
+      bool carReturned;
+      uint outstandingFee;
+      }
+
+    // enum State { Unavailable, Available }
+    // State public carState;
+    address payable public company; // the address of the company's account
+    uint public contractBalance = 0; // to check the current balance in the contract if it matches availability of cars
+    uint public carCnt = 0; // to count the number of the cars added
+    uint public customerCnt = 0; // to count the number of the customers
+    uint public recordCnt = 0; // to count the number of the rental records 
+
+    mapping(uint => carInfo) public cars; // to store the information of each car type
+    mapping(uint => customerInfo) customers; // to store the information of each car type
+    mapping(uint => rentalHistory) public records; // to store the rental records: the customer address to the index of car he/she rent
+
+
+  /********************************************************************************************************/
+  /*                                           Constructor                                                */
+  /********************************************************************************************************/
+
+    constructor() payable {
+        company = payable(msg.sender);
+    }
+
+
+  /********************************************************************************************************/
+  /*                                           Modifiers                                                  */
+  /********************************************************************************************************/
+
+    // To check msg.sender is the company
+    modifier isCompany() {
+        require(msg.sender == company, "Only company can add car information.");
+        _;
+    }
+
+    // To check critical car info entered is correct
+    modifier infoCorrect(uint seaterNum, uint carStatus) {
+        bool numvalid = false;
+        bool statusvalid = false;
+        if (seaterNum == 4 || seaterNum == 6 || seaterNum == 8) {
+            numvalid = true;
+        }
+
+        if (carStatus == 0 || carStatus == 1) {
+            statusvalid = true;
+        }
+        require(numvalid == true, "Seater options is only 4, 6 or 8");
+        require(statusvalid == true, "Car Status 0:Unavailable, 1:Available");
+        _;
+    }
+
+    // To check the car is available
+    modifier isAvailable(uint typeId) {
+      require(cars[typeId].carAvailable == true, "This car is not available, choose another one!");
+      _;
+    }
+    
+    // To check the msg.value is twice of the rent
+    modifier isEnough(uint numOfDays) {
+      require(msg.value >= 10 ether * numOfDays, 
+             "ETH Value sent in is not enough for deposit for the number of days intended to rent.");
+      _;
+    }
+
+    // To check the renter has no past outstanding fees before renting
+    modifier noOutstanding(address walletAddress) {
+      bool pass = true;
+
+      for (uint i = recordCnt; i > 0; i--) {
+        if (records[i-1].walletAdd == walletAddress) {
+          if (records[i-1].outstandingFee != 0) {
+            // If the latest record available for this wallet address shows outstanding fee, renter is not allowed to rent
+            pass = false;
+            break;
+          }
+          else if (records[i-1].outstandingFee == 0) {
+            // If the latest record available for this wallet address shows no outstanding fee, no need to check earlier records anymore.
+            pass = true;
+            break;
+          }
+        }
+        else if (i==0) {
+          // No record of this wallet add yet, proceed to rent car
+          pass = true;
+        }
+      }
+      require(pass == true, "You have outstanding fees from previous rental, please proceed to pay your fee using pay fee function!");
+      _;
+    }
+
+
+
+  /********************************************************************************************************/
+  /*                                           Functions                                                  */
+  /********************************************************************************************************/
+
+    // Flow 2: Listing of car fleet for rent  
+    // The company should add information of the car type
+    function addCarInfo(string memory carPlateNum, string memory carDescription, uint seaterNum, uint carStatus) 
+    payable public isCompany infoCorrect(seaterNum, carStatus) {
+        bool carAvail = false;
+        bool unique = true;
+        if (carStatus == 1) {
+            carAvail = true;
+        }
+
+        // Convert carplate to lowercase, then compare with existing cars list to make sure we dont list the same car twice
+        for (uint i = 0; i < carCnt+1; i++) {
+            if (keccak256(bytes(_toLower(cars[i].carPlate))) == keccak256(bytes(_toLower(carPlateNum)))) {
+                unique = false;
+                break; 
+            }
+        }
+        require(unique == true, "You have added this car plate before!");
+        require(msg.value == 10 ether, "The company has to deposit 10 ETH to instill confidence of car availability!");
+        
+        // Update contract balance
+        contractBalance = contractBalance + msg.value;
+
+        // Only add if verified car plate has never been uploaded before
+        cars[carCnt] = carInfo(carPlateNum, carDescription, seaterNum, carAvail);
+        carCnt++;
+    }
+
+
+    // Flow 3: Check availability  
+    function carID_checkAvailability(uint seaterNum) 
+    public view returns( uint[] memory) {
+      // Allow user to input preference base on seater number, then we loop       
+      // through the dynamic list: cars, and output all those that carAvailabile = true
+      // Also to provide total contract balance to see if it matches the number of cars available for confidence
+      require(seaterNum == 4 || seaterNum == 6 || seaterNum ==8, "We only have 4/6/8-seater cars! ");
+      require(carCnt > 0, "No cars listed yet!");
+
+      uint resultCount;
+      for (uint i = 0; i < carCnt+1; i++) {
+        if (cars[i].carAvailable && cars[i].carType == seaterNum) {
+          resultCount++;    // determine the result count
+        }
+      }
+      
+      //create the fixed-length array
+      uint[] memory result = new uint[](resultCount); 
+      uint j;
+      for (uint i = 0; i < carCnt+1; i++) {
+        if (cars[i].carAvailable && cars[i].carType == seaterNum) {
+          result[j++] = i;    // fill the array
+        }
+      }
+      
+      // Output: recommendation of cars typeId list (index number) e.g 2,3,5
+      return result;
+    }
+
+
+    // Flow 4 & 5: Choose car that is available, Once deposit received from customer, company release car key to customer and key in start date. Contract amount will be reduced.
+    // The customer should deposit 10ETH * num of days they intend to rent 
+    function rentCar(uint carID, uint duration, string memory Name,
+      string memory IDnum, uint age, string memory resiAddress, address walletAddress) 
+      payable public isAvailable(carID) isEnough(duration) noOutstanding(msg.sender) {
+        require(walletAddress == msg.sender, "You must rent car using your own wallet address!");
+        require(age >= 21, "You must be at least 21 years old to rent a car!");
+        require(cars[carID].carAvailable == true, 
+                "This car is currently not available, use carID_checkAvailability to find out which carID is available!");
+
+        // Update contract balance
+        contractBalance = contractBalance + msg.value;
+
+        bool unique = true;
+        // uint start = block.timestamp;
+        // uint end = start + (duration * 1 days);
+        
+        // Customer database: Record customer info if unique
+        for (uint i = 0; i < customerCnt+1; i++) {
+          if (keccak256(bytes(_toLower(customers[i].identityNum))) == keccak256(bytes(_toLower(IDnum)))) {
+            unique = false;
+            break;
+          }
+        }
+        if (unique) {
+          customers[customerCnt] = customerInfo(Name, IDnum, age, resiAddress, walletAddress);
+          customerCnt++;
+        }
+
+        // Car Renting database: record cars that were rented and to which wallet address 
+        records[recordCnt] = rentalHistory(cars[carID].carPlate, Name, walletAddress, msg.value, block.timestamp, 
+                                           block.timestamp + (duration * 1 days), duration, false, 0);
+        
+        cars[carID].carAvailable = false; // update car availability
+        recordCnt++;
+        
+
+        // As number of car available has reduced by 1, return the 10ETH deposited by company during listing
+        uint companyDeposit = 10 ether;
+        contractBalance = contractBalance - companyDeposit;
+        company.transfer(10 ether);
+    }
+
+    // Flow 6 & 7: return car and update state
+    // Company key in end date, then calculate total renting cost base on days rented.
+    // If the car is damaged, company will key in the amount to charge that will be added to total renting cost
+    // deduct total renting cost from deposit, any surplus return.
+    function confirmReturn(string memory carPlateNum, uint damageCharge, uint returnYear, uint returnMonth, uint returnDay) 
+    payable public isCompany {
+      uint recordIndex = 0;
+      uint carIndex = 0;
+      bool returnValid = false;
+      
+      // Check records and car list to ensure car is rented by customer, and get the wallet address of the customer
+      for (uint i = recordCnt; i > 0; i--) {
+        if ( keccak256(bytes(_toLower(records[i-1].carPlate))) == keccak256(bytes(_toLower(carPlateNum))) ) {
+          recordIndex = i-1;
+          returnValid = true;
+          break;
+        }
+      }
+      require(returnValid, "This car is not rented by customer.");
+
+      for (uint j = 0; j < carCnt; j++) {
+        if ( keccak256(bytes(_toLower(cars[j].carPlate))) == keccak256(bytes(_toLower(carPlateNum))) ) {
+          carIndex = j;
+          break;
+        }
+      }
+
+      // Final check to make sure this is the right car we looking at. 
+      require(cars[carIndex].carAvailable == false, "The car is not rented by customer.");
+      require(records[recordIndex].carReturned == false, "This car has already been returned.");
+
+      // Check date is entered correctly
+      require(returnDay <= 31 && returnDay >= 1, "Check your day entered!");
+      require(returnMonth <= 12 && returnMonth >= 1, "Check your month entered!");
+      require(returnYear == getYear(block.timestamp), "Year of return should be the current year now which the car is returned.");
+
+      // To confirm the return, the company need send in 10ETH which will be used to relist the car later
+      require(msg.value == 10 ether, "The company needs to send in 10ETH to confirm the car return and relist it.");
+
+      // To get the rental information
+      address payable _walletAdd = payable(records[recordIndex].walletAdd);
+      // uint _depositAmt = records[recordIndex].depositAmt;
+      uint _numOfDays = records[recordIndex].numOfDays;
+      // uint _startDate = records[recordIndex].startDate;
+      // uint _carType = cars[carIndex].carType;
+      uint rent = 1 ether;
+      uint additionalCharge = 1 ether; 
+      uint surplusAmt = 0 ether;
+      uint lateFee = 0 ether;
+      // uint returnDate = block.timestamp;
+      uint returnDate = timestampFromDate(returnYear, returnMonth, returnDay);
+
+      // Update the return date in records
+      records[recordIndex].endDate = returnDate;
+
+      // check car type that was rented, default is 1 ether for 4-seater
+      if (cars[carIndex].carType == 6){
+        rent = 2 ether;
+      } 
+      else if (cars[carIndex].carType == 8) {
+        rent = 3 ether;
+      }
+
+      // Check if the car is returned late by calculating the days difference 
+      //between startDate and endDate, and compare with numOfDays that user intended to rent.
+      uint totalRentedDays = diffDays(records[recordIndex].startDate, returnDate);
+
+      if(totalRentedDays > _numOfDays) {
+        lateFee = rent * (totalRentedDays - _numOfDays); //charge rent * number of days late
+      }
+
+      // To calculate the total renting cost
+      additionalCharge = additionalCharge * damageCharge; // convert to ether
+      uint fee = _numOfDays * rent + additionalCharge + lateFee;
+
+      // update avail of the car by changing state to available
+      cars[carIndex].carAvailable = true;
+
+      // Update record
+      records[recordIndex].carReturned = true;
+
+      // Update the transfer of 10ETH from company account to relist the car. 
+      contractBalance = contractBalance + 10 ether;
+
+      // Check if deposit can cover the total fee
+      if (records[recordIndex].depositAmt <= fee) {
+        // log the deficit that we require from the user
+        records[recordIndex].outstandingFee = fee - records[recordIndex].depositAmt;
+
+        // No surplus and we take all the deposit 
+        // surplusAmt = 0 ether;
+        contractBalance = contractBalance - records[recordIndex].depositAmt; 
+        company.transfer(records[recordIndex].depositAmt);
+      }
+      else { 
+        surplusAmt = records[recordIndex].depositAmt - fee;
+        
+        // update contractbalance
+        contractBalance = contractBalance - surplusAmt;
+        contractBalance = contractBalance - fee;
+
+        // Transfer surplus to customer
+        _walletAdd.transfer(surplusAmt);
+
+        // Transfer fee earnings to company
+        company.transfer(fee);
+      }
+
+      // Ensure no overflow for the surplus, definitely will be between 0 and a value less than the deposit
+      require(surplusAmt >= 0 && surplusAmt < records[recordIndex].depositAmt, "Customer's deposit not enough to cover the additional damage charge, topup required!");
+    }
+
+
+    // Pay outstanding fees if needed
+    function ChecknPayOutstanding(address walletAddress) 
+    payable public {
+      require(msg.sender == walletAddress, "You need to be the owner of this wallet address to pay outstanding fees.");
+      address payable _walletAdd = payable(walletAddress);
+
+      bool needPay = true;
+      uint ind = 0;
+      uint surplus = 0 ether;
+
+      for (uint i = recordCnt; i > 0; i--) {
+        if (records[i-1].walletAdd == walletAddress && records[i-1].outstandingFee == 0 ether) {
+          // If the latest record available for this wallet address shows no outstanding fee, renter is allowed to rent 
+          needPay = false;
+          break;
+        }
+        else if (records[i-1].walletAdd == walletAddress && records[i-1].outstandingFee != 0 ether) {
+          // found the record index where this wallet address has an outstanding fine
+          ind = i-1;
+        }
+      }
+
+      require(needPay == true, "You have no outstanding fees to pay! Go ahead and rent a car!");
+
+      if (records[ind].outstandingFee > 0 ether && records[ind].outstandingFee < 100 ether) {
+        // require(msg.value >= 10 ether, "Please send at least 10 ETH to pay your outstanding fine. Surplus will be returned to you.");
+        require(msg.value >= records[ind].outstandingFee, string(abi.encodePacked("Please pay for the outstanding ether: ", uint2str(records[ind].outstandingFee/1000000000000000000))));
+        surplus = msg.value - records[ind].outstandingFee;
+        records[ind].outstandingFee = 0 ether;
+        company.transfer(records[ind].outstandingFee); 
+        _walletAdd.transfer(surplus);
+      }
+
+      // if (records[ind].outstandingFee >= 10  && records[ind].outstandingFee < 100) {
+      //   require(msg.value >= 100 ether, "Please send at least 100 ETH to pay your outstanding fine. Surplus will be returned to you.");
+      //   surplus = msg.value - records[ind].outstandingFee;
+      //   records[ind].outstandingFee = 0;
+      //   company.transfer(records[ind].outstandingFee); 
+      //   _walletAdd.transfer(surplus);
+      // }
+
+      if (records[ind].outstandingFee >= 100 ether) {
+        needPay = false;
+        require(needPay == true, "Your outstanding fee is too large and thus have been blacklisted from rental. Please contact a representative from ABC Rental Company for settlement.");
+      }
+
+      require(recordCnt > 0, "There is no outstanding associated thus far!");
+    }
+
+
+  /********************************************************************************************************/
+  /*                                          Helper Functions                                            */
+  /********************************************************************************************************/
+
+    // Convert strings to lowercase 
+    function _toLower(string memory str) internal pure returns (string memory) {
+        bytes memory bStr = bytes(str);
+        bytes memory bLower = new bytes(bStr.length);
+        for (uint i = 0; i < bStr.length; i++) {
+            // Uppercase character...
+            if ((uint8(bStr[i]) >= 65) && (uint8(bStr[i]) <= 90)) {
+                // So we add 32 to make it lowercase
+                bLower[i] = bytes1(uint8(bStr[i]) + 32);
+            } else {
+                bLower[i] = bStr[i];
+            }
+        }
+        return string(bLower);
+    }
+    
+    // Convert uint25 to string
+    function uint2str(uint256 _i) internal pure returns (string memory str) {
+      if (_i == 0) {
+        return "0";
+        }
+        uint256 j = _i;
+        uint256 length;
+        while (j != 0) {
+          length++;
+          j /= 10;
+          }
+          bytes memory bstr = new bytes(length);
+          uint256 k = length;
+          j = _i;
+          while (j != 0) {
+            bstr[--k] = bytes1(uint8(48 + j % 10));
+            j /= 10;
+            }
+            str = string(bstr);
+            }
+
+
+    // Datetime function from BokkyPooBahs: https://github.com/bokkypoobah/BokkyPooBahsDateTimeLibrary/blob/master/contracts/BokkyPooBahsDateTimeLibrary.sol
+    // uint SECONDS_PER_DAY = 24 * 60 * 60;
+    function _daysFromDate(uint year, uint month, uint day) internal pure returns (uint _days) {
+        int OFFSET19700101 = 2440588;
+        require(year >= 1970);
+        int _year = int(year);
+        int _month = int(month);
+        int _day = int(day);
+
+        int __days = _day
+          - 32075
+          + 1461 * (_year + 4800 + (_month - 14) / 12) / 4
+          + 367 * (_month - 2 - (_month - 14) / 12 * 12) / 12
+          - 3 * ((_year + 4900 + (_month - 14) / 12) / 100) / 4
+          - OFFSET19700101;
+
+        _days = uint(__days);
+    }
+    function _daysToDate(uint _days) internal pure returns (uint year, uint month, uint day) {
+        int __days = int(_days);
+        int OFFSET19700101 = 2440588;
+
+        int L = __days + 68569 + OFFSET19700101;
+        int N = 4 * L / 146097;
+        L = L - (146097 * N + 3) / 4;
+        int _year = 4000 * (L + 1) / 1461001;
+        L = L - 1461 * _year / 4 + 31;
+        int _month = 80 * L / 2447;
+        int _day = L - 2447 * _month / 80;
+        L = _month / 11;
+        _month = _month + 2 - 12 * L;
+        _year = 100 * (N - 49) + _year + L;
+
+        year = uint(_year);
+        month = uint(_month);
+        day = uint(_day);
+    }
+    
+    function timestampFromDate(uint year, uint month, uint day) internal pure returns (uint timestamp) {
+        uint SECONDS_PER_DAY = 24 * 60 * 60;
+        timestamp = _daysFromDate(year, month, day) * SECONDS_PER_DAY;
+    }
+
+    function diffDays(uint fromTimestamp, uint toTimestamp) internal pure returns (uint _days) {
+        uint SECONDS_PER_DAY = 24 * 60 * 60;
+        require(fromTimestamp <= toTimestamp);
+        _days = (toTimestamp - fromTimestamp) / SECONDS_PER_DAY;
+    }
+
+    function getYear(uint timestamp) internal pure returns (uint year) {
+        uint SECONDS_PER_DAY = 24 * 60 * 60;
+        (year,,) = _daysToDate(timestamp / SECONDS_PER_DAY);
+    }
+}
+
